@@ -9,8 +9,10 @@ import re
 import itertools
 import shutil
 import subprocess
+import sys
 import multiprocessing as mp
 import logging
+from pathlib import Path
 from typing import *
 
 import numpy as np
@@ -27,12 +29,16 @@ def run_tmalign(query: str, reference: str, fast: bool = False, dual: bool = Fal
     assert os.path.isfile(reference)
 
     # Check if TMalign is installed
-    exec = shutil.which("TMalign")
-    if not exec:
+    executable = shutil.which("TMalign")
+    if not executable:
+        env_candidate = Path(sys.executable).resolve().parent / "TMalign"
+        if env_candidate.is_file() and os.access(env_candidate, os.X_OK):
+            executable = str(env_candidate)
+    if not executable:
         raise FileNotFoundError("TMalign not found in PATH")
 
     # Build the command
-    cmd = f"{exec} {query} {reference}"
+    cmd = f"{executable} {query} {reference}"
     if fast:
         cmd += " -fast"
     try:

@@ -217,7 +217,7 @@ class Tokenizer:
             assert da_cts[2][0] > da_cts[1][0]
             index = Tokenizer.DIHEDRAL_ANGLES.index(da_cts[2][1])
         else:
-            breakpoint()
+            raise ValueError(f"Could not infer token phase for geometry keys: {key}")
         start = 3*(index//3)
         end = 3*(((index+length-1)+1)//3)+1 # end bond id, but we round it up so it's 1 (mod 3)
         off_start = index-start
@@ -287,7 +287,7 @@ class Tokenizer:
 
 
     def _standardize_res(self):
-        breakpoint()
+        raise NotImplementedError("Residue standardization is not implemented.")
         # self.res = {0:[],1:[],2:[]}
         # for i,t,l in new_tokens:
         #     self.res[t].append(self.token_geo(i, l))        
@@ -383,12 +383,12 @@ class Tokenizer:
             # find the dihedral
             b = start+length # find dihedral around this bond        
             if b < 3*self.n-1:
+                bt = Tokenizer.BOND_ANGLES[(b-1)%3]
+                tokenized.append(("BOND_ANGLE", bt, self._bond_angle(b-1)))
                 dt = Tokenizer.DIHEDRAL_ANGLES[(b-2)%3]
                 tokenized.append(("DIHEDRAL", dt, self._dihedral_angle(b-2)))
                 dt = Tokenizer.DIHEDRAL_ANGLES[(b-1)%3]
                 tokenized.append(("DIHEDRAL", dt, self._dihedral_angle(b-1)))
-                bt = Tokenizer.BOND_ANGLES[(b-1)%3]
-                tokenized.append(("BOND_ANGLE", bt, self._bond_angle(b-1)))
         return tokenized
 
     @staticmethod
@@ -536,5 +536,6 @@ def debug():
 
 
 if __name__ == "__main__":
-    breakpoint()
+    if os.environ.get("GEOBPE_DEBUG_BREAKPOINT") == "1":
+        breakpoint()
     debug()

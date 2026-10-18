@@ -45,7 +45,47 @@ import logging
 logger = logging.getLogger(__name__)
 
 gpu_lock = threading.Lock()
-client = ESMC.from_pretrained("esmc_300m").to("cuda") # or "cpu"
+client = None
+ESMC_MODEL_NAME = "esmc_300m"
+
+
+def resolve_esmc_device(device=None):
+    """Resolve the ESM C device without importing or loading weights eagerly."""
+    if device is None:
+        device = os.environ.get("GEOBPE_ESMC_DEVICE")
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "ESM C was configured for CUDA, but CUDA is not available. "
+            "Set GEOBPE_ESMC_DEVICE=cpu or pass --cuda cpu."
+        )
+    return resolved
+
+
+def configure_esmc_client(device=None):
+    """Load ESM C once, on demand, and switch devices if requested."""
+    global client
+    target_device = resolve_esmc_device(device)
+
+    if client is not None:
+        try:
+            current_device = next(client.parameters()).device
+        except (AttributeError, StopIteration):
+            current_device = None
+        if current_device == target_device:
+            return client
+
+    client = ESMC.from_pretrained(ESMC_MODEL_NAME).to(target_device)
+    return client
+
+
+def get_esmc_client(device=None):
+    if client is None:
+        return configure_esmc_client(device)
+    return client
 
 def pad_structures(items, constant_value=0, dtype=None, truncation_length=600, pad_length=None):
     batch_size = len(items)
@@ -886,6 +926,7 @@ def compute_embedding(item):
     protein = ESMProtein.from_protein_chain(ProteinChain.from_pdb(fname))    
     # Ensure only one thread performs GPU operations at a time.
     with gpu_lock:
+        client = get_esmc_client()
         protein_tensor = client.encode(protein)
         output = client.logits(
             protein_tensor,
@@ -960,7 +1001,10 @@ class MyDataset(Dataset):
                 i = mapping[key]
                 tok_res_ids = set(pdb_chain.residue_index)
                 if tokenizers[i].n != len(tok_res_ids):
-                    breakpoint()
+                    raise ValueError(
+                        f"{key}: tokenizer has {tokenizers[i].n} residues but "
+                        f"{pdb_chain.residue_index} maps to {len(tok_res_ids)} residues"
+                    )
                 sample['fold_label'] = sample['fold_label']
                 my_data.append((prot, chain, tokenizers[i], sample))
         self.data = my_data
@@ -987,7 +1031,10 @@ class MyDataset(Dataset):
         for i in range(len(results)):
             if len(results[i]) != self.data[i][2].n:
                 # this should never happen
-                breakpoint()
+                raise ValueError(
+                    f"ESM embedding length {len(results[i])} does not match "
+                    f"tokenizer length {self.data[i][2].n}"
+                )
     def __len__(self):
         return len(self.data)
     
@@ -1047,7 +1094,8 @@ class ResidueDataset(MyDataset):
                     sample[label_key] = np.array(sample[label_key])[~mask].tolist()
                     assert all(pdb_chain.residue_index==(np.array(sample['residue_index'])[~mask]).tolist())
                 else:
-                    breakpoint()
+                    print(f"length mismatch between {pdb_path} and tokenizer, skipping")
+                    continue
                 if tokenizers[i].n != len(sample[label_key]):
                     # check residue_index
                     print(f"length mismatch between {pdb_path} and tokenizer, skipping")

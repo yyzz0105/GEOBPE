@@ -150,10 +150,11 @@ def main():
     print(f"{max_workers} workers")
     if args.save_dir:
         save_dir = Path(args.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
     else:
         cur_time = time.time()
         save_dir = Path(args.base_dir) / f'./ckpts/{cur_time}'
-        os.makedirs(save_dir, exist_ok=True)        
+        os.makedirs(save_dir, exist_ok=True)
     
     print(f"save_dir: {save_dir}")
     src_file = Path(args.src_pkl)
@@ -182,13 +183,14 @@ def main():
     dataset = FullCathCanonicalCoordsDataset(args.data_dir, 
                                         zero_center=False, 
                                         toy=args.toy,
+                                        debug=args.debug,
                                         use_cache=False, 
                                         pad=args.pad)
     pargs = []
     idx = 0
     for struc in dataset.structures:
         if (struc['angles']['psi']==struc['angles']['psi']).sum() < len(struc['angles']['psi'])-1:
-            print(f"skipping {i}, {struc['fname']} because of missing dihedrals")
+            print(f"skipping {struc['fname']} because of missing dihedrals")
         else:
             # detect if backbone parser matches ProteinChain.from_pdb            
             if len(struc['angles']) == len(ProteinChain.from_pdb(struc['fname'])):           
@@ -235,6 +237,7 @@ def main():
         bpe.n.append(len(tokenizers))
         bpe.tokenizers.extend(tokenizers)
     else:
+        bpe.n = len(tokenizers)
         bpe.tokenizers = tokenizers
     pickle.dump(bpe, open(out_path, "wb+"))
     print(os.path.abspath(out_path))

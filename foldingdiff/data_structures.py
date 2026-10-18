@@ -227,7 +227,6 @@ class TokenHierarchy(dict):
         
 
     def __delitem__(self, key):
-        breakpoint()
         # Custom behavior when deleting an item.
         self.parent.last_action = f"__delitem__: {key}"
         # print(f"[TokenHierarchy] Deleting key {key}")
@@ -240,7 +239,6 @@ class TokenHierarchy(dict):
         return value
     
     def popitem(self):
-        breakpoint()
         # Custom behavior for popitem.
         key, value = super().popitem()
         self.parent.last_action = f"popitem: removed {key} with value {value}"
@@ -248,7 +246,6 @@ class TokenHierarchy(dict):
         return key, value
     
     def update(self, *args, **kwargs):
-        breakpoint()
         # Custom behavior for updating the dictionary.
         super().update(*args, **kwargs)
         self.parent.last_action = "update: dictionary updated"

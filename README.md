@@ -26,6 +26,85 @@ pip install esm==3.2.0 --no-deps # install ESM
 pip install -e ./  # make sure ./ is the root
 ```
 
+## Reproducibility and Scope
+
+The core protein-tokenizer pipeline is runnable in this repository:
+
+- `bin/encode.py`: extract protein backbone geometry and learn GeoBPE tokens.
+- `bin/induce.py`: encode additional structures with a learned tokenizer.
+- `bin/train.py`: train the structure language model, with CPU, single-GPU, and `DataParallel` multi-GPU support.
+- Sampling/inference: decode token sequences back to 3-bead protein backbone coordinates and write PDB output.
+
+### End-to-end smoke reproduction
+
+The following command runs the complete code path with two training chains and
+two validation chains:
+
+```bash
+bash scripts/reproduce_geobpe_toy.sh
+```
+
+The script performs:
+
+```text
+geometry extraction -> 500-bin GeoBPE token learning -> glue IK
+-> induce -> one-epoch LM training -> token sampling -> BPE decoding
+-> N-CA-C forward-kinematics reconstruction -> PDB output
+-> independent token-to-PDB validation -> unit tests
+```
+
+Set `PYTHON_BIN` to select a different environment and `RUN_DIR` to select the
+output directory. The default output is `runs/reproduce_geobpe_toy`.
+
+The validated local 500-bin smoke artifacts under
+`runs/smoke_encode_500_k16` and `runs/smoke_induce_500_k16` show:
+
+- an actual vocabulary size of 1504, including learned motif tokens and 500-bin
+  angle/bond-length tokens;
+- token-ID round trips of 0.1121 and 0.1215 Angstrom RMSD for the two encoded
+  chains;
+- reconstruction error against the two original backbones of 4.7373 and 4.0957
+  Angstrom backbone RMSD, dominated by the deliberately coarse smoke setup;
+- two sampled sequences, each with 257 token IDs, that decode independently to
+  65 residues and 195 N/CA/C atoms;
+- sampled-token decoding versus independently re-read generated PDBs at 0.0581
+  and 0.0541 Angstrom aligned backbone RMSD.
+
+This is a full code-path reproduction, not a numerical reproduction of the
+paper benchmarks. The one-epoch/two-chain LM metrics are smoke-test values and
+must not be compared with the paper. This checkout contains 72 training PDBs,
+37 validation PDBs, 5 CAMEO structures, and 5 CASP14 structures; it does not
+contain the complete paper preprocessing result. No official GeoBPE checkpoint
+is included or referenced by this repository, so a paper-level inference
+comparison cannot be run from the current checkout alone.
+
+The ESM package is installed without its dependency resolver because ESM 3.2.0's published metadata pins an older PyTorch ecosystem (`torchtext` and Biotite) that conflicts with the tested Torch 2.6 environment. The incompatible `torchtext` pin is therefore not installed. The GeoBPE tokenizer, induction, training, and geometric decoding paths work without that metadata being satisfied. The optional PyG wheels were removed from `environment.yml` because the old `pt24` builds conflict with Torch 2.6; only the optional `bin/pdb_to_residues_esm.py` helper needs PyG.
+
+Use `--skip_sctm` when running the language-model pipeline if the protein inverse-folding/SCTM evaluation dependency is unavailable. This skips that optional evaluation branch while leaving tokenization, training, sampling, and geometric reconstruction available.
+
+### What reconstruction actually does
+
+Reconstruction does not read coordinates from `bond_to_token` or from the BPE merge tree. The merge tree records only the token hierarchy. Decoding proceeds by:
+
+1. dequantizing token geometry (`BPE.dequantize`);
+2. expanding token geometry with `BPE.recover` and building the decoded structure
+   with `BPE.recover_structure`;
+3. reconstructing coordinates by forward kinematics (`Tokenizer.compute_coords`, `Tokenizer.geo_nerf`, and `NERFBuilder/place_dihedral`).
+
+The "glue optimization" step updates the three boundary angles `(omega, C-N-CA, phi)` with LBFGS under an SE(3) terminal-frame loss and an empirical angle prior. With `glue-opt-method=all`, all boundaries in one chain are optimized together against all of that chain's cached exit frames; independent chains are parallelized across workers. This is the paper's batch/global boundary-IK refinement, not optimization of side-chain, all-atom, or unconstrained conformational degrees of freedom.
+
+### RNA scope
+
+The current implementation is a protein backbone tokenizer, not an RNA tokenizer. Protein atom names, N-CA-C NERF topology, `ProteinChain`, ESM embeddings, ProteinMPNN/SCTM integrations, PDB output, and structural metrics are hardcoded. Applying GeoBPE to RNA requires an adapter for:
+
+- RNA 3-bead extraction, for example `[P, C4', N1]` for C/U and `[P, C4', N9]` for A/G;
+- RNA-specific bond lengths, bond angles, torsions, geometry bins, and token topology;
+- an RNA NERF/decoder, sequence model, metrics, and PDB writer.
+
+The conceptual GeoBPE steps transfer to RNA, including local boundary optimization. However, a 3-bead representation is only an intermediate representation for chemically strict reconstruction. Full-atom restoration still requires sugar-phosphate topology, base placement, chirality, ring closure, and phosphodiester connectivity. This is also true for proteins: GeoBPE reconstructs the N-CA-C backbone, not all side-chain atoms. RNA is harder because its sugar ring, phosphate linkage, base orientation, and local flexibility are less constrained by a three-point backbone.
+
+This repository is therefore a reasonably complete reproduction of the core protein pipeline, but it does not claim full reproduction of every paper benchmark, full-atom reconstruction, or direct RNA application without an adapter.
+
 ## Downloading data
 
 The RCSB PDB pretraining dataset and CAMEO/CASP test data should be placed under `data/vqvae_pretrain/{train|validation|CAMEO|CASP14}`. For train/validation, we include only a few .pdb files for smoke testing (download the rest through official channels).
@@ -66,8 +145,10 @@ We include the following resources to make it easy to use GeoBPE:
 ./scripts/encode.sh 0 0 3 3 pretrain '1-50' histogram 5 5 false 0 2-2:3-5:5-1:6-2:8-1 500 true 0.0 all true true 10 1000 # slurm ready; prepend sbatch settings if using
 
 # suggested setting for pareto-optimal compression-reconstruction
-./scripts/encode.sh 0 0 3 3 pretrain '1-500' histogram 5 5 false 0 2-100:3-500:5-20:6-100:8-5:9-20:11-1:12-5:14-1 500 true 1.0 all true true 1 0
+IK_TRANSLATION_WEIGHT=1.0 ./scripts/encode.sh 0 0 3 3 pretrain '1-500' histogram 5 5 false 0 2-100:3-500:5-20:6-100:8-5:9-20:11-1:12-5:14-1 5000 true 1.0 all true true 10 0
 ```
+
+The command-line defaults now follow Table 14 of the paper: `p-min-size=0`, `bins={1:500}`, free bond lengths, glue prior `1.0`, `(wR, wt)=(1.0, 0.1)`, `max-num-strucs=5000`, `num-p={2:100,3:500,5:20,6:100}`, and RMSD super-resolution enabled. For the Pareto runs, Table 17/18 use `wt=1.0`; set `IK_TRANSLATION_WEIGHT=1.0` as shown above or pass `--ik-translation-weight 1.0` directly.
 
 Each run creates a folder `ckpts/$d` (e.g. `ckpts/1763070917.6459317`) containing periodic tokenizer checkpoints (`bpe_iter=$iter.pkl`), visualizations, and metrics. You can monitor the running statistics (files matching `*=$iter*`) and stop when desired vocabulary size / token size / segmentation lengths is hit. A suggested stopping iteration (based on LLM scaling heuristic, see [./docs/lm-heuristic.png](./docs/lm-heuristic.png)) is marked in `run_iter=$iter.png`.
 

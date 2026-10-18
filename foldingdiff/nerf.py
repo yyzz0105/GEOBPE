@@ -86,7 +86,10 @@ class NERFBuilder:
         """Build out the molecule"""
         retval = self.init_coords.copy()
         if self.use_torch:
-            retval = [torch.tensor(x, device=self.device) for x in retval]
+            retval = [
+                torch.as_tensor(x, device=self.device, dtype=self.phi.dtype)
+                for x in retval
+            ]
 
         # The first value of phi at the N terminus is not defined
         # The last value of psi and omega at the C terminus are not defined

@@ -1,5 +1,6 @@
 # User-added files
 .vscode/*
+data/pdb_data/
 *.pkl
 data/cath/*
 **/*.gz
@@ -25,6 +26,7 @@ temp/*
 scripts/temp/*
 *output.tsv
 wandb/*
+runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

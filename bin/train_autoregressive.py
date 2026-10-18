@@ -21,8 +21,11 @@ from transformers import BertConfig
 
 from foldingdiff import datasets, modelling, losses, plotting, utils
 from foldingdiff import custom_metrics as cm
-
-from train import ANGLES_DEFINITIONS, build_callbacks, record_args_and_metadata
+from foldingdiff.legacy_train_utils import (
+    ANGLES_DEFINITIONS,
+    build_callbacks,
+    record_args_and_metadata,
+)
 
 
 def get_train_valid_test_sets(

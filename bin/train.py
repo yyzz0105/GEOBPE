@@ -1,5 +1,7 @@
 import argparse
 import pickle
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -15,9 +17,100 @@ import random
 import logging
 import time
 from tqdm import tqdm
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from foldingdiff.datasets import extract_backbone_coords
 from foldingdiff.tokenizer import *
 from foldingdiff.metrics import *
+
+
+def _sctm_device_count(model_device):
+    """Return the number of CUDA devices usable by the SCTM subprocesses."""
+    if model_device.type != "cuda" or not torch.cuda.is_available():
+        return 0
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if not cvd:
+            return 0
+    return torch.cuda.device_count()
+
+
+def _resolve_device(requested):
+    """Resolve the requested training device and fail clearly on bad CUDA requests."""
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"Requested device {requested}, but CUDA is not available")
+    return device
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def _maybe_wrap_data_parallel(model, device):
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        return nn.DataParallel(model)
+    return model
+
+
+def _load_model_state(model, state):
+    """Load either a plain state dict or one saved through DataParallel."""
+    target = _unwrap_model(model)
+    if state and all(key.startswith("module.") for key in state):
+        state = {key.removeprefix("module."): value for key, value in state.items()}
+    target.load_state_dict(state)
+
+
+def _extract_coords_for_paths(paths, pfunc, desc, debug=False):
+    """Extract coordinates with bounded parallelism for small debug runs."""
+    if debug or len(paths) <= 1:
+        return [pfunc(path) for path in tqdm(paths, desc=desc)]
+    n_workers = min(len(paths), os.cpu_count() or 1)
+    with mp.Pool(processes=n_workers) as pool:
+        return pool.map(pfunc, tqdm(paths, desc=desc))
+
+
+def _compute_sctm_metrics(gen_pdb_files, model_device, skip_sctm=False):
+    if skip_sctm:
+        logging.info("Skipping SCTM designability because --skip_sctm was set.")
+        return {}, None
+    if not gen_pdb_files:
+        logging.info("Skipping SCTM designability because no structures were generated.")
+        return {}, None
+
+    n_devices = _sctm_device_count(model_device)
+    if n_devices == 0:
+        logging.warning("Skipping SCTM designability: no visible CUDA devices.")
+        return {}, None
+
+    try:
+        out = parallel_sctm_designability(
+            gen_pdb_files,
+            n_devices=n_devices,
+            tm_cutoff=0.5,
+            n_designs=8,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Skipping SCTM designability because the optional external "
+            "ProteinMPNN/OmegaFold pipeline failed: %s",
+            exc,
+        )
+        return {}, None
+    table = wandb.Table(
+        dataframe=pd.DataFrame(list(out.items()), columns=["pdb", "sctm"])
+    )
+    return summarize_sctm(out), table
+
+
 # -----------------------------
 # 0) ARGPARSE
 # -----------------------------
@@ -71,6 +164,14 @@ def parse_args():
         help="Skip training and run final eval on test splits"
     )
     parser.add_argument(
+        "--device", type=str, default="auto",
+        help="Training device: auto, cpu, cuda, or cuda:<index>"
+    )
+    parser.add_argument(
+        "--skip_sctm", action="store_true",
+        help="Skip the optional ProteinMPNN/OmegaFold scTM designability metric"
+    )
+    parser.add_argument(
         "--model_path", type=str, default=None,
         help="Path to a saved model checkpoint for inference mode"
     )    
@@ -94,6 +195,8 @@ def parse_args():
     parser.add_argument("--batch_size",   type=int,   default=32)
     parser.add_argument("--lr",           type=float, default=1e-4)
     parser.add_argument("--epochs",       type=int,   default=100)
+    parser.add_argument("--max_len",      type=int,   default=None,
+                        help="Optional maximum token sequence length for debug/smoke runs")
     parser.add_argument("--probe_layer",  type=int,   default=4)
     parser.add_argument("--probe_epochs", type=int,   default=5)
     parser.add_argument("--probe_lr",     type=float, default=1e-3)
@@ -182,7 +285,7 @@ class ProteinDataset(Dataset):
         pad_len = self.max_len - len(seq)
         input_ids = seq + [0] * pad_len
         attention_mask = [1] * len(seq) + [0] * pad_len
-        labels = input_ids[1:] + [0]
+        labels = seq[1:] + [-100] * (pad_len + 1)
         item = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
@@ -217,7 +320,7 @@ class SeqDataset(Dataset):
         pad_len = self.max_len - len(seq)
         input_ids = seq + [0] * pad_len
         attention_mask = [1] * len(seq) + [0] * pad_len
-        labels = input_ids[1:] + [0]
+        labels = seq[1:] + [-100] * (pad_len + 1)
         item = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
@@ -229,10 +332,25 @@ class SeqDataset(Dataset):
 
 def split_dataset(ds, seed=0):
     n = len(ds)
+    if n == 0:
+        raise ValueError("Cannot split an empty dataset")
     idxes = list(range(n))
     random.seed(seed)
     random.shuffle(idxes)
-    train_idxes, valid_idxes, test_idxes = idxes[:int(0.8*n)], idxes[int(0.8*n): int(0.9*n)], idxes[int(0.9*n):]
+    if n == 1:
+        train_idxes = valid_idxes = test_idxes = idxes
+    elif n == 2:
+        train_idxes, valid_idxes, test_idxes = idxes[:1], idxes[1:], idxes[1:]
+    else:
+        n_valid = max(1, round(0.1 * n))
+        n_test = max(1, round(0.1 * n))
+        if n - n_valid - n_test < 1:
+            n_valid = n_test = 1
+        train_end = n - n_valid - n_test
+        valid_end = train_end + n_valid
+        train_idxes = idxes[:train_end]
+        valid_idxes = idxes[train_end:valid_end]
+        test_idxes = idxes[valid_end:]
     return Subset(ds, train_idxes), Subset(ds, valid_idxes), Subset(ds, test_idxes)
 
 
@@ -391,9 +509,11 @@ def evaluate_next_token(model, dataloader, device, criterion):
             labels = batch["labels"].to(device)
             logits, _ = model(input_ids, mask)
             loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            nt = mask.sum().item()
+            nt = max(mask.sum().item() - len(batch["input_ids"]), 0)
             total_loss += loss.item() * nt
             total_tokens += nt
+    if total_tokens == 0:
+        return float("nan")
     return total_loss / total_tokens
 
 def evaluate_probe(model,
@@ -552,7 +672,7 @@ def sample_unconditional_seqs(
     logging.info(f"Legal lengths: {legal_lengths}")
     assert legal_lengths, "No K in length_prior satisfies K%4==1"
 
-    vocab_size = model.token_emb.num_embeddings
+    vocab_size = _unwrap_model(model).token_emb.num_embeddings
     logging.info(f"Model embedding vocab_size: {vocab_size}")
     model.eval()
     samples = []    
@@ -574,7 +694,7 @@ def sample_unconditional_seqs(
                 probs = torch.nn.functional.softmax(logits / temperature, dim=-1)
                 # Check for NaNs or all-0s
                 if not torch.isfinite(probs).all() or probs.sum() == 0:
-                    breakpoint()
+                    raise RuntimeError("Probabilities NaN or degenerate")
                 nxt = torch.multinomial(probs, 1)  # shape (1,)
                 seq = torch.cat([seq, nxt.unsqueeze(0)], dim=1)
             # If we got here, sample completed successfully
@@ -583,6 +703,21 @@ def sample_unconditional_seqs(
                 f"[Sample {sample_idx}] Finished, sequence length: {len(samples[-1])} (SUCCESS)"
             )
     return samples
+
+
+def _joint_vocab_ranges(bpe):
+    """Return the four contiguous vocab ranges in Algorithm 17 order."""
+    n = len(bpe._tokens)
+    ranges = {0: (0, n)}
+    for step, key in enumerate(("C:1N:1CA", "omega", "phi"), start=1):
+        lo = n + bpe.cum_bin_count(key)
+        hi = lo + len(bpe._bin_counts[1][key])
+        ranges[step] = (lo, hi)
+
+    assert ranges[3][1] == bpe.vocab_size, (
+        f"Joint vocab ranges end at {ranges[3][1]}, expected {bpe.vocab_size}"
+    )
+    return ranges
 
 
 def sample_unconditional(
@@ -611,27 +746,14 @@ def sample_unconditional(
     logging.info(f"Legal lengths: {legal_lengths}")
     assert legal_lengths, "No K in length_prior satisfies K%4==1"
 
-    # 2) precompute your 4 ranges
-    n         = len(bpe._tokens)
-    omega_off = bpe.cum_bin_count('omega')
-    cac1n_off = bpe.cum_bin_count('C:1N:1CA')
-    phi_off   = bpe.cum_bin_count('phi')
-    logging.info(f"n={n} omega_off={omega_off} cac1n_off={cac1n_off} phi_off={phi_off}")
-    ranges = {
-        0: (0,   n),
-        1: (n + omega_off,
-            n + omega_off + len(bpe._bin_counts[1]['omega'])),
-        2: (n + phi_off,
-            n + phi_off + len(bpe._bin_counts[1]['phi'])),
-        3: (n + cac1n_off,
-            n + cac1n_off + len(bpe._bin_counts[1]['CA:C:1N'])),
-    }
+    # 2) precompute the four ranges in MOTIF, theta, omega, phi order
+    ranges = _joint_vocab_ranges(bpe)
     logging.info(f"Ranges: {ranges}")
     term_motifs = np.array([i < len(bpe._tokens) \
                    and Tokenizer.num_bonds(list(bpe._tokens.values())[i]) == 2 \
                     for i in range(bpe.vocab_size)])
     logging.info(f"term_motifs shape: {term_motifs.shape}, bpe.vocab_size: {bpe.vocab_size}")
-    vocab_size = model.token_emb.num_embeddings
+    vocab_size = _unwrap_model(model).token_emb.num_embeddings
     logging.info(f"Model embedding vocab_size: {vocab_size}")
     model.eval()
     samples = []    
@@ -720,19 +842,104 @@ def sample_unconditional(
         # except Exception as e:
         #     logging.warning(f"[Decode] Visualization failed for sample {i}: {e}")
 
-    return tokenizers
+    return tokenizers, samples
+
+
+def _json_compatible(value):
+    """Recursively convert numpy and tuple values into JSON-compatible values."""
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(val) for val in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _save_generation_report(
+    outdir,
+    tokenizers,
+    samples,
+    gen_pdb_files,
+    metrics,
+    ntp_loss,
+    ntp_ppl,
+    bpe_checkpoint,
+    model_checkpoint,
+    vocab_size,
+    max_len,
+):
+    """Persist all artifacts needed to inspect and reproduce a sampling run."""
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    token_records = []
+    for chain_idx, tokenizer in enumerate(tokenizers):
+        hierarchy = []
+        for start, token_id, n_bonds in sorted(tokenizer.bond_to_token.values()):
+            hierarchy.append(
+                {
+                    "start_bond": int(start),
+                    "token_id": _json_compatible(token_id),
+                    "n_bonds": int(n_bonds),
+                }
+            )
+        token_records.append(
+            {
+                "sample_index": chain_idx,
+                "n_tokens": int(len(tokenizer.bond_to_token)),
+                "n_residues": int(tokenizer.n),
+                "tokens": hierarchy,
+            }
+        )
+
+    payload = {
+        "sampled_tokens": _json_compatible(samples),
+        "token_hierarchy": token_records,
+        "sampled_pdb_fnames": [
+            str(Path(path).relative_to(outdir))
+            if Path(path).is_relative_to(outdir)
+            else str(path)
+            for path in gen_pdb_files
+        ],
+        "metrics": _json_compatible(metrics),
+        "test_ntp_loss": float(ntp_loss),
+        "test_ntp_ppl": float(ntp_ppl),
+        "vocab_size": int(vocab_size),
+        "max_len": int(max_len),
+        "bpe_checkpoint": str(Path(bpe_checkpoint).resolve()),
+        "model_checkpoint": str(Path(model_checkpoint).resolve()),
+    }
+    report_path = outdir / "metrics.json"
+    with report_path.open("w") as sink:
+        json.dump(payload, sink, indent=2, allow_nan=True)
+
+    with (outdir / "sampled_tokens.json").open("w") as sink:
+        json.dump(payload["sampled_tokens"], sink, indent=2)
+    with (outdir / "sampled_pdb_fnames.json").open("w") as sink:
+        json.dump(payload["sampled_pdb_fnames"], sink, indent=2)
+    return report_path
 
 # -----------------------------
 # 5) MAIN TRAIN/EVAL LOOP
 # -----------------------------
 def main(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     if args.debug:
         # override for minimal debug run
         args.d_model    = 64
         args.num_layers = 1
         args.num_heads  = 2
         args.d_ff       = 256
-        args.max_len    = 32
+        # One complete four-token cycle plus the terminating motif.
+        args.max_len    = 33
         args.batch_size = 4
         args.epochs     = 1
 
@@ -760,6 +967,14 @@ def main(args):
         # next-token splits: train / val / test_ntp
         if isinstance(bpe.n, list):
             assert len(bpe.n) in [2, 3]
+            if sum(bpe.n) > len(full_ds):
+                logging.warning(
+                    "Ignoring stale BPE split metadata %s for %s tokenized structures",
+                    bpe.n,
+                    len(full_ds),
+                )
+                bpe.n = len(full_ds)
+        if isinstance(bpe.n, list):
             if len(bpe.n) == 2:
                 train_ds, val_ds = Subset(full_ds, range(bpe.n[0])), Subset(full_ds, range(bpe.n[0], bpe.n[0]+bpe.n[1]))
                 test_ntp_ds = val_ds
@@ -777,6 +992,11 @@ def main(args):
         val_ds = SeqDataset(valid, max_len)
         test_ntp_ds = val_ds
 
+    if args.max_len is not None:
+        max_len = min(max_len, args.max_len)
+        if args.checkpoint_path:
+            full_ds.max_len = max_len
+
     # probing splits: probe_train / probe_val / probe_test
     if args.labels_path:
         probe_train_ds, probe_val_ds, probe_test_ds = split_probe_dataset(full_ds)        
@@ -787,9 +1007,15 @@ def main(args):
         # val_ds         = Subset(val_ds,   idx10)
         # test_ntp_ds    = Subset(test_ntp_ds, idx10)
         if args.labels_path:
-            probe_train_ds = Subset(probe_train_ds, idx10)
-            probe_val_ds   = Subset(probe_val_ds,   idx10)
-            probe_test_ds  = Subset(probe_test_ds,  idx10)    
+            probe_train_ds = Subset(
+                probe_train_ds, range(min(10, len(probe_train_ds)))
+            )
+            probe_val_ds = Subset(
+                probe_val_ds, range(min(10, len(probe_val_ds)))
+            )
+            probe_test_ds = Subset(
+                probe_test_ds, range(min(10, len(probe_test_ds)))
+            )
 
     # 4) DataLoaders
     collate_fn         = make_collate_fn(max_len)
@@ -803,30 +1029,32 @@ def main(args):
         probe_test_loader  = DataLoader(probe_test_ds,  batch_size=args.batch_size, collate_fn=collate_fn)
 
     # 5) Model / optimizer / loss
-    device = torch.device("cuda" if (not args.debug and torch.cuda.is_available()) else "cpu")
+    device = _resolve_device(args.device)
+    logging.info(f"Using device: {device}")
     model = ProteinLM(
         vocab_size, args.d_model, args.num_layers,
         args.num_heads, args.d_ff, max_len
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        model = nn.DataParallel(model)        
+    model = _maybe_wrap_data_parallel(model, device)
 
     # Inference mode?  Load weights and skip training
     if args.inference:
-        if Path(args.model_path).is_dir():
-            breakpoint()
         assert args.model_path, "--model_path required in inference mode"
-        model.load_state_dict(torch.load(args.model_path, map_location=device))
+        if Path(args.model_path).is_dir():
+            raise IsADirectoryError(
+                f"--model_path must point to a checkpoint file, got directory: {args.model_path}"
+            )
+        state = torch.load(args.model_path, map_location=device)
+        _load_model_state(model, state)
         logging.info(f"loaded model from {args.model_path}")
-        length_prior = [len(seq) for seq in full_ds.seqs]
+        length_prior = [min(len(seq), max_len) for seq in full_ds.seqs]
         start_prior = [seq[0] for seq in full_ds.seqs]  
         model.eval()        
 
         # a) Sample unconditional
-        tokenizers = sample_unconditional(
+        tokenizers, samples = sample_unconditional(
             model=model,
             device=device,
             bpe=bpe,
@@ -839,26 +1067,44 @@ def main(args):
         )        
         train_pdb_files = [full_ds.fnames[item["idx"]] for item in train_ds]
         full_coords_pfunc = functools.partial(extract_backbone_coords, atoms=["N", "CA", "C"])
-        pool = mp.Pool(processes=mp.cpu_count())
-        train_coords = pool.map(full_coords_pfunc, tqdm(train_pdb_files, desc="extract coords train"))
+        train_coords = _extract_coords_for_paths(
+            train_pdb_files, full_coords_pfunc, "extract coords train", args.debug
+        )
         sampled_dfs = [t._angles_and_dists[["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"]] for t in tokenizers]
         outdir = Path(args.model_path).parent
         gen_pdb_files = write_preds_pdb_folder(sampled_dfs, outdir / "sampled_pdb")
-        generated_coords = pool.map(full_coords_pfunc, tqdm(gen_pdb_files, desc="extract coords gen"))
-        metrics = compute_metrics(gen_pdb_files, generated_coords, train_pdb_files, train_coords)
-        out = parallel_sctm_designability(
-            gen_pdb_files, n_devices=len(os.environ["CUDA_VISIBLE_DEVICES"]), tm_cutoff=0.5, n_designs=8
+        generated_coords = _extract_coords_for_paths(
+            gen_pdb_files, full_coords_pfunc, "extract coords gen", args.debug
         )
-        sctm_metrics = summarize_sctm(out)
-        table = wandb.Table(dataframe=pd.DataFrame(list(out.items()), columns=['pdb','sctm']))
+        metrics = compute_metrics(gen_pdb_files, generated_coords, train_pdb_files, train_coords)
+        sctm_metrics, table = _compute_sctm_metrics(
+            gen_pdb_files, device, skip_sctm=args.skip_sctm
+        )
         metrics.update(sctm_metrics)
-        wandb.log({**metrics, "sctm_table": table})
+        if table is not None:
+            wandb.log({**metrics, "sctm_table": table})
+        else:
+            wandb.log(metrics)
 
         # b) Next-token on **test** split
-        crit = nn.CrossEntropyLoss(ignore_index=0)       
+        crit = nn.CrossEntropyLoss(ignore_index=-100)
         ntp_loss = evaluate_next_token(model, test_ntp_loader, device, crit)
         ntp_ppl  = torch.exp(torch.tensor(ntp_loss))
         wandb.log({"test/ntp_loss": ntp_loss, "test/ntp_ppl": ntp_ppl})         
+        report_path = _save_generation_report(
+            outdir=outdir,
+            tokenizers=tokenizers,
+            samples=samples,
+            gen_pdb_files=gen_pdb_files,
+            metrics=metrics,
+            ntp_loss=ntp_loss,
+            ntp_ppl=ntp_ppl,
+            bpe_checkpoint=args.checkpoint_path,
+            model_checkpoint=args.model_path,
+            vocab_size=vocab_size,
+            max_len=max_len,
+        )
+        logging.info(f"Wrote generation report to {report_path}")
                 
         # c) Zero-shot probe on **probe_test** (trained on probe_train)
         if args.labels_path:
@@ -876,7 +1122,7 @@ def main(args):
 
     # 6) Training loop
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    crit = nn.CrossEntropyLoss(ignore_index=0)
+    crit = nn.CrossEntropyLoss(ignore_index=-100)
     step = 0
     best_loss, best_path = float("inf"), None
     # --- Early stopping config ---
@@ -942,17 +1188,15 @@ def main(args):
     if args.checkpoint_path:   
         # repeats inference mode, can wrap this into a function             
         state = torch.load(best_path, map_location=device)
-        model.load_state_dict(state)
-        if torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
+        _load_model_state(model, state)
         model = model.to(device)
         logging.info(f"loaded model from {best_path}")
-        length_prior = [len(seq) for seq in full_ds.seqs]
+        length_prior = [min(len(seq), max_len) for seq in full_ds.seqs]
         start_prior = [seq[0] for seq in full_ds.seqs]  
         model.eval()        
 
         # a) Sample unconditional
-        tokenizers = sample_unconditional(
+        tokenizers, samples = sample_unconditional(
             model=model,
             device=device,
             bpe=bpe,
@@ -965,25 +1209,41 @@ def main(args):
         )
         train_pdb_files = [full_ds.fnames[item["idx"]] for item in train_ds]
         full_coords_pfunc = functools.partial(extract_backbone_coords, atoms=["N", "CA", "C"])
-        pool = mp.Pool(processes=mp.cpu_count())
-        train_coords = pool.map(full_coords_pfunc, tqdm(train_pdb_files, desc="extract coords train"))
+        train_coords = _extract_coords_for_paths(
+            train_pdb_files, full_coords_pfunc, "extract coords train", args.debug
+        )
         sampled_dfs = [t._angles_and_dists[["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"]] for t in tokenizers]
         outdir = Path(best_path).parent
         gen_pdb_files = write_preds_pdb_folder(sampled_dfs, outdir / "sampled_pdb")
-        generated_coords = pool.map(full_coords_pfunc, tqdm(gen_pdb_files, desc="extract coords gen"))
-        metrics = compute_metrics(gen_pdb_files, generated_coords, train_pdb_files, train_coords)
-        out = parallel_sctm_designability(
-            gen_pdb_files, n_devices=len(os.environ["CUDA_VISIBLE_DEVICES"]), tm_cutoff=0.5, n_designs=8
+        generated_coords = _extract_coords_for_paths(
+            gen_pdb_files, full_coords_pfunc, "extract coords gen", args.debug
         )
-        sctm_metrics = summarize_sctm(out)
+        metrics = compute_metrics(gen_pdb_files, generated_coords, train_pdb_files, train_coords)
+        sctm_metrics, _ = _compute_sctm_metrics(
+            gen_pdb_files, device, skip_sctm=args.skip_sctm
+        )
         metrics.update(sctm_metrics)
         wandb.log(metrics)
 
         # b) Next-token on **test** split
-        crit = nn.CrossEntropyLoss(ignore_index=0)       
+        crit = nn.CrossEntropyLoss(ignore_index=-100)
         ntp_loss = evaluate_next_token(model, test_ntp_loader, device, crit)
         ntp_ppl  = torch.exp(torch.tensor(ntp_loss))
         wandb.log({"test/ntp_loss": ntp_loss, "test/ntp_ppl": ntp_ppl})         
+        report_path = _save_generation_report(
+            outdir=outdir,
+            tokenizers=tokenizers,
+            samples=samples,
+            gen_pdb_files=gen_pdb_files,
+            metrics=metrics,
+            ntp_loss=ntp_loss,
+            ntp_ppl=ntp_ppl,
+            bpe_checkpoint=args.checkpoint_path,
+            model_checkpoint=best_path,
+            vocab_size=vocab_size,
+            max_len=max_len,
+        )
+        logging.info(f"Wrote generation report to {report_path}")
                 
         # c) Zero-shot probe on **probe_test** (trained on probe_train)
         if args.labels_path:
@@ -998,7 +1258,8 @@ def main(args):
             )
             wandb.log({f"test/probe_{key}": metrics[key] for key in metrics})
     else:
-        model.load_state_dict(torch.load(best_path, map_location=device))
+        state = torch.load(best_path, map_location=device)
+        _load_model_state(model, state)
         logging.info(f"loaded model from {best_path}")
         length_prior = [len(seq) for seq in train+valid]
         start_prior = [seq[0] for seq in train+valid]  
@@ -1019,6 +1280,6 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()    
-    if args.debug:
+    if args.debug and os.environ.get("GEOBPE_DEBUG_BREAKPOINT") == "1":
         breakpoint()
     main(args)

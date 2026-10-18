@@ -71,7 +71,9 @@ def parse_pdb(pdb_file):
 def call_freqgeo(G):
     scipy.io.savemat('./data/cath/graphs.mat', {"G": G})
 
-    breakpoint()
+    raise NotImplementedError(
+        "The legacy MATLAB freqgeo bridge is not part of the Python GeoBPE reproduction."
+    )
     try:
         result = subprocess.run(
             ["matlab", "-batch", "testmexfreqgeo"],
@@ -100,7 +102,9 @@ def call_freqgeo(G):
         g = graphs[0, i][0, 0]
         nodelabels, nodepos, edges = g
         n = len(nodelabels)
-        breakpoint()    
+        raise NotImplementedError(
+            "MATLAB freqgeo outputs are not parsed in the Python GeoBPE reproduction."
+        )
 
 
 def parse_args():
@@ -113,7 +117,8 @@ def parse_args():
     parser.add_argument("--log-dir", type=str, default="logs", 
                         help="Directory where log files will be saved.")
     parser.add_argument("--data-dir", type=str, default="cath", help="""Which dataset. Suggested choices:  \
-                        'cath', 'homo', 'ec', 'bindint', 'bindbio', 'repeat', 'catint', 'catbio', 'conserved'
+                        'pretrain' (alias 'train'), 'prevalid' (alias 'validation'), 'cameo', 'casp',
+                        'cath', 'homo', 'bindint', 'bindbio', 'repeat', 'catint', 'catbio', 'conserved'
                         """)
     parser.add_argument("--toy", type=int, default=0, 
                             help="Number of PDB files. 0 for all.")    
@@ -122,37 +127,53 @@ def parse_args():
     parser.add_argument("--vis", type=str2bool, default=False)
     parser.add_argument("--num-vis", type=int, default=3, help="number of examples to visualize")
     # hparams
-    parser.add_argument("--res-init", type=str2bool, default=False, help="base token type, residue vs bond (default bond)")
-    parser.add_argument("--free-bonds", type=str2bool, default=False, help="whether to not standardize bond lengths")
-    parser.add_argument("--rmsd-super-res", type=str2bool, default=False, help="whether to resolve structures every new rmsd key")
+    parser.add_argument("--res-init", type=str2bool, default=True, help="base token type, residue vs bond (default residue)")
+    parser.add_argument("--free-bonds", type=str2bool, default=True, help="whether to not standardize bond lengths")
+    parser.add_argument("--rmsd-super-res", type=str2bool, default=True, help="whether to resolve structures every new rmsd key")
     parser.add_argument("--rmsd-only", type=str2bool, default=False, help="whether to not set rmsd keys")
     parser.add_argument("--bin-strategy", help="how to bin values", default="histogram", choices=["histogram", "histogram-cover", "uniform"])
-    parser.add_argument("--bins", type=str2dict, help=":-separated number of bins per size step, example: 1-100:10-10 means 100 bins from token size 1 to 9, 10 bins from 10 onwards", default="1-10")
+    parser.add_argument("--bins", type=str2dict, help=":-separated number of bins per size step, example: 1-100:10-10 means 100 bins from token size 1 to 9, 10 bins from 10 onwards", default="1-500")
     parser.add_argument("--sec", type=str2bool, default=False, help="whether to compute sec structures to guide token discovery")
     parser.add_argument("--sec-eval", type=str2bool, default=False, help="whether to evaluate sec structure overlap")
     parser.add_argument(
         "--p-min-size",
         type=int_or_inf,
-        default=float("inf"),
-        help="when to start using rmsd binning; 0 to turn off bpe; or ‘inf’ to mean no limit",
+        default=0,
+        help="minimum token size for RMSD/k-medoids partitioning; use 0 for the paper setting or 'inf' to disable partitioning",
     )
     parser.add_argument(
         "--num-p",
         type=str2dictorint,
-        default=3,
+        default="2-100:3-500:5-20:6-100",
         help="num partitions for rmsd binning; OR -separated number of rmsd partitions per size step, example: 3-100:9-10 means 100 partitions from token size 3 to 9, 10 bins from 9 onwards"
     )
     parser.add_argument(
         "--max-num-strucs",
         type=int,
-        default=1000,
+        default=5000,
         help="max N for running medoids",
     )
     parser.add_argument("--max-iter", type=int, default=10000, help="max number of BPE iters")
-    parser.add_argument("--glue-opt", type=str2bool, default=False, help="whether to opt the glue angles for rmsd keys")
-    parser.add_argument("--glue-opt-prior", type=float, default=0.0, help="whether to impose a prior loss in glue opt")
+    parser.add_argument("--glue-opt", type=str2bool, default=True, help="whether to opt the glue angles for rmsd keys")
+    parser.add_argument("--glue-opt-prior", type=float, default=1.0, help="weight of the empirical glue-angle prior")
     parser.add_argument("--glue-opt-every", type=int, default=10, help="how often to glue opt")
-    parser.add_argument("--glue-opt-method", choices=["each", "all"], default="each", help="optimize each glue after rounding or all glues together")
+    parser.add_argument("--glue-opt-method", choices=["each", "all"], default="all", help="optimize each glue after rounding or all glues together")
+    parser.add_argument(
+        "--ik-rotation-weight",
+        "--wR",
+        dest="ik_rotation_weight",
+        type=float,
+        default=1.0,
+        help="rotation term weight in the SE(3) glue IK objective",
+    )
+    parser.add_argument(
+        "--ik-translation-weight",
+        "--wt",
+        dest="ik_translation_weight",
+        type=float,
+        default=0.1,
+        help="translation term weight in the SE(3) glue IK objective",
+    )
     parser.add_argument("--seed", type=int, default=0, help="random seed for bpe's rng")
     parser.add_argument("--cache", action='store_true', help="whether to use cached data")
     parser.add_argument("--save-every", type=int, default=10, help="how often to dump")
@@ -268,7 +289,7 @@ def main():
         else:
             dataset = FullCathCanonicalCoordsDataset(args.data_dir, 
                                                     use_cache=args.cache, 
-                                                    debug=False, 
+                                                    debug=args.debug,
                                                     zero_center=False, 
                                                     toy=args.toy, 
                                                     pad=args.pad, 
@@ -299,6 +320,8 @@ def main():
                     glue_opt_prior=args.glue_opt_prior,
                     glue_opt_method=args.glue_opt_method,
                     glue_opt_every=args.glue_opt_every,
+                    ik_rotation_weight=args.ik_rotation_weight,
+                    ik_translation_weight=args.ik_translation_weight,
                     seed=args.seed)
             pickle.dump(bpe, open(init_bpe_path, 'wb+'))
         N = len(bpe.tokenizers)
@@ -369,8 +392,26 @@ def main():
         )        
         ## end        
         bpe.bin()    
-        if args.debug: 
-            bpe_debug = BPE(dataset.structures, bins=args.bins, save_dir=args.save_dir)
+        if args.debug and not args.glue_opt:
+            bpe_debug = BPE(
+                dataset.structures,
+                bins=args.bins,
+                bin_strategy=args.bin_strategy,
+                save_dir=args.save_dir,
+                rmsd_partition_min_size=args.p_min_size,
+                rmsd_super_res=args.rmsd_super_res,
+                rmsd_only=args.rmsd_only,
+                num_partitions=args.num_p,
+                max_num_strucs=args.max_num_strucs,
+                res_init=args.res_init,
+                std_bonds=not args.free_bonds,
+                glue_opt_prior=args.glue_opt_prior,
+                glue_opt_method=args.glue_opt_method,
+                glue_opt_every=args.glue_opt_every,
+                ik_rotation_weight=args.ik_rotation_weight,
+                ik_translation_weight=args.ik_translation_weight,
+                seed=args.seed,
+            )
             bpe_debug.initialize()
             bpe_debug.old_bin()
     if args.save_dir != bpe.save_dir:
@@ -397,7 +438,7 @@ def main():
                     print(f"frames have different sizes")
         bpe.step()
         if bpe._step != t+1:
-            breakpoint()
+            raise RuntimeError(f"BPE step mismatch: expected {t+1}, got {bpe._step}")
         for ind in range(num_vis):
             bpe.tokenizers[ind].bond_to_token.tree.visualize(os.path.join(args.save_dir, f'tokens_{ind}_iter={t}.png'), horizontal_gap=0.5, font_size=6)
         if t % args.save_every == 0:
@@ -436,25 +477,27 @@ def main():
                     no_iters=t, 
                     step_iter=args.save_every, 
                     ratio=N/1000)
-        if args.debug: 
+        if args.debug and args.glue_opt:
+            logger.warning("Skipping legacy old_step equivalence checks because glue optimization is enabled.")
+        elif args.debug:
             bpe_debug.old_step()
             for i in range(bpe.n):
                 t = bpe.tokenizers[i]
                 t_ = bpe_debug.tokenizers[i]
                 if t.bond_to_token != t_.bond_to_token:
-                    breakpoint()
+                    raise AssertionError(f"bond_to_token mismatch at tokenizer {i}")
                 if t.token_pos != t_.token_pos:
-                    breakpoint()
+                    raise AssertionError(f"token_pos mismatch at tokenizer {i}")
             for k in bpe._geo_dict:
                 if k not in bpe_debug._geo_dict:
-                    breakpoint()
+                    raise AssertionError(f"extra geo key in optimized BPE: {k}")
                 elif set(bpe._geo_dict[k]) != set(bpe_debug._geo_dict[k]):
-                    breakpoint()
+                    raise AssertionError(f"geo key entries mismatch for {k}")
             for k in bpe_debug._geo_dict:
                 if k not in bpe._geo_dict:
-                    breakpoint()
+                    raise AssertionError(f"missing geo key in optimized BPE: {k}")
                 elif set(bpe_debug._geo_dict[k]) != set(bpe._geo_dict[k]):
-                    breakpoint()
+                    raise AssertionError(f"geo key entries mismatch for {k}")
     logger.info("Script finished.")
 
 

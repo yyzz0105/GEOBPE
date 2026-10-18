@@ -51,7 +51,6 @@ def find_secondary_structures(fname):
             ss = "C"        
         # Append tuple (residue number, ss) for later grouping
         ss_segments[chain_id].append((resseq, ss))  
-    breakpoint()
     all_segments = []
     # Group segments for each chain and print results
     print("Secondary Structure Segments (from DSSP):")
@@ -62,7 +61,7 @@ def find_secondary_structures(fname):
             print(f"  {ss_type}: residues {start} to {end}")        
         all_segments.append(segments)
     if len(all_segments) > 1:
-        breakpoint()
+        print(f"{fname}: multiple chains found; returning segments for all chains")
     else:
         return all_segments[0]
     return all_segments

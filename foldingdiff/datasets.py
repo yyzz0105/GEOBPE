@@ -386,9 +386,9 @@ class CathCanonicalAnglesDataset(Dataset):
                 fnames = glob.glob(os.path.join(CATBIO_DIR, "*.pdb"))
             elif pdbs == "conserved":
                 fnames = glob.glob(os.path.join(CONSERVED_DIR, "*.pdb"))
-            elif pdbs == "pretrain":
+            elif pdbs in ("pretrain", "train"):
                 fnames = glob.glob(os.path.join(PRETRAIN_DIR, "*.pdb"))
-            elif pdbs == "prevalid":
+            elif pdbs in ("prevalid", "validation"):
                 fnames = glob.glob(os.path.join(PRETRAIN_VALID_DIR, "*.pdb"))
             elif pdbs == "atlas":
                 fnames = glob.glob(os.path.join(ATLAS_DIR, "*.pdb"))

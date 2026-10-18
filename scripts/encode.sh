@@ -41,6 +41,8 @@ free_bonds=${17}
 rmsd_super_res=${18}
 glue_opt_every=${19}
 max_iter=${20}
+ik_rotation_weight=${IK_ROTATION_WEIGHT:-1.0}
+ik_translation_weight=${IK_TRANSLATION_WEIGHT:-0.1}
 
 if [ -n "${21}" ]; then
   extra="--save-dir ${21}"
@@ -49,6 +51,7 @@ else
 fi
 export CUDA_VISIBLE_DEVICES=""
 export OMP_NUM_THREADS=1
+export MPLBACKEND=${MPLBACKEND:-Agg}
 cmd=(  
     $runner bin/encode.py \
     --bin-strategy $bin_strat \
@@ -74,6 +77,8 @@ cmd=(
     --glue-opt-prior $glue_opt_prior \
     --glue-opt-method $glue_opt_method \
     --glue-opt-every $glue_opt_every \
+    --ik-rotation-weight $ik_rotation_weight \
+    --ik-translation-weight $ik_translation_weight \
     --max-iter $max_iter \
     $extra
 )

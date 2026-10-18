@@ -968,5 +968,5 @@ def main(args):
 
 if __name__ == "__main__":    
     args = parse_args()
-    client = ESMC.from_pretrained("esmc_300m").to(args.cuda) # or "cpu"        
+    configure_esmc_client(args.cuda)
     main(args)

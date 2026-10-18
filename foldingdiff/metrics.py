@@ -1,7 +1,7 @@
 from pathlib import Path
 import multiprocessing as mp
 import pandas as pd
-import os, sys
+import os, re
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -9,7 +9,6 @@ try:
     mp.set_start_method("spawn", force=True)   # avoid fork-after-init deadlocks
 except RuntimeError:
     pass
-print(f"[child] pid={os.getpid()} CVD={os.getenv('CUDA_VISIBLE_DEVICES')} args={sys.argv}", flush=True)
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Tuple
 import logging
@@ -297,9 +296,10 @@ def _visible_device_tokens() -> List[str]:
     Handles both numeric indices (e.g., "0,1,2") and MIG UUIDs
     (e.g., "MIG-...,...").
     """
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if cvd:
-        # preserve MIG UUIDs verbatim; trim whitespace
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        # An explicitly empty value means that CUDA is disabled for this job.
+        # Preserve MIG UUIDs verbatim and trim whitespace.
         return [tok.strip() for tok in cvd.split(",") if tok.strip()]
 
     # Fallback: sniff via nvidia-smi -L (handles MIG & non-MIG)
@@ -480,8 +480,14 @@ def compute_metrics(generated_pdb_paths, generated_coords, train_pdb_paths=None,
         metrics.update(ss_metrics)        
     # --- Diversity (mean pairwise RMSD) ---
     pairs = list(combinations(generated_pdb_paths, 2))
-    with mp.Pool(mp.cpu_count()) as pool:
-        div_vals = pool.starmap(tm_score, tqdm(pairs, desc="diversity"), chunksize=1)
+    if pairs:
+        n_workers = min(len(pairs), mp.cpu_count())
+        with mp.Pool(n_workers) as pool:
+            div_vals = pool.starmap(
+                tm_score, tqdm(pairs, desc="diversity"), chunksize=1
+            )
+    else:
+        div_vals = [np.nan]
     mean_diversity_tm = float(np.mean(div_vals))
     logging.info(f"mean_diversity_tm: {mean_diversity_tm}")
     metrics["diversity_tm"] = mean_diversity_tm
